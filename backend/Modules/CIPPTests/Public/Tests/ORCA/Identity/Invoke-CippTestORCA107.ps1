@@ -14,16 +14,14 @@ function Invoke-CippTestORCA107 {
         }
 
         # Exo returns EndUserSpamNotificationFrequency as an ISO 8601 duration string ('PT4H', 'P1D', 'P7D').
-        # 'PT0S' or null means notifications are disabled. The placeholder policy name 'DefaultGlobalPolicy'
-        # indicates the global policy has never been configured.
+        # 'PT0S' or null means notifications are disabled.
         $FailedPolicies = [System.Collections.Generic.List[object]]::new()
         $PassedPolicies = [System.Collections.Generic.List[object]]::new()
 
         foreach ($Policy in $Policies) {
             $Frequency = $Policy.EndUserSpamNotificationFrequency
-            $IsConfigured = $Policy.Name -ne 'DefaultGlobalPolicy'
             $IsEnabled = $false
-            if ($IsConfigured -and $Frequency) {
+            if ($Frequency) {
                 try {
                     $TimeSpan = [System.Xml.XmlConvert]::ToTimeSpan([string]$Frequency)
                     $IsEnabled = $TimeSpan.TotalSeconds -gt 0
