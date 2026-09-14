@@ -6,57 +6,94 @@ function Invoke-CippTestORCA107 {
     param($Tenant)
 
     try {
-        $Policies = Get-CIPPTestData -TenantFilter $Tenant -Type 'ExoGlobalQuarantinePolicy'
+        $QuarantinePolicies = @(Get-CIPPTestData -TenantFilter $Tenant -Type 'ExoQuarantinePolicy')
+        $ContentFilterPolicies = @(Get-CIPPTestData -TenantFilter $Tenant -Type 'ExoHostedContentFilterPolicy')
+        $ContentFilterRules = @(Get-CIPPTestData -TenantFilter $Tenant -Type 'ExoHostedContentFilterRule')
 
-        if (-not $Policies) {
+        if ($QuarantinePolicies.Count -eq 0 -or $ContentFilterPolicies.Count -eq 0) {
             Add-CippTestResult -TenantFilter $Tenant -TestId 'ORCA107' -TestType 'Identity' -Status 'Skipped' -ResultMarkdown 'No data found in database. This may be due to missing required licenses or data collection not yet completed.' -Risk 'Low' -Name 'End-user spam notification is enabled' -UserImpact 'Low' -ImplementationEffort 'Low' -Category 'Quarantine'
             return
         }
 
-        # Exo returns EndUserSpamNotificationFrequency as an ISO 8601 duration string ('PT4H', 'P1D', 'P7D').
-        # 'PT0S' or null means notifications are disabled.
-        $FailedPolicies = [System.Collections.Generic.List[object]]::new()
-        $PassedPolicies = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($Policy in $Policies) {
-            $Frequency = $Policy.EndUserSpamNotificationFrequency
-            $IsEnabled = $false
-            if ($Frequency) {
-                try {
-                    $TimeSpan = [System.Xml.XmlConvert]::ToTimeSpan([string]$Frequency)
-                    $IsEnabled = $TimeSpan.TotalSeconds -gt 0
-                } catch {
-                    $IsEnabled = $false
+        $RelevantPolicies = @($ContentFilterPolicies | Where-Object {
+                if ($_.Name -eq 'Default') {
+                    return $true
                 }
-            }
 
-            $DisplayFrequency = if ($Frequency) { [string]$Frequency } else { 'Not set' }
-            $Annotated = $Policy | Select-Object *, @{ Name = 'DisplayFrequency'; Expression = { $DisplayFrequency } }
+                # Preset security policies are intentionally excluded for now.
+                # They need some extra handling, and current Standard/Strict presets already notify users about quarantined spam.
+                if ($_.RecommendedPolicyType -in @('Standard', 'Strict')) {
+                    return $false
+                }
 
-            if ($IsEnabled) {
-                $PassedPolicies.Add($Annotated) | Out-Null
-            } else {
-                $FailedPolicies.Add($Annotated) | Out-Null
+                $PolicyName = $_.Name
+                return $null -ne ($ContentFilterRules | Where-Object {
+                        $_.Name -eq $PolicyName -and
+                        $_.State -eq 'Enabled' -and
+                        ($_.SentTo -or $_.SentToMemberOf -or $_.RecipientDomainIs)
+                    } | Select-Object -First 1)
+            })
+
+        if ($RelevantPolicies.Count -eq 0) {
+            Add-CippTestResult -TenantFilter $Tenant -TestId 'ORCA107' -TestType 'Identity' -Status 'Skipped' -ResultMarkdown 'No relevant EOP anti-spam policies found in database.' -Risk 'Low' -Name 'End-user spam notification is enabled' -UserImpact 'Low' -ImplementationEffort 'Low' -Category 'Quarantine'
+            return
+        }
+
+        $QuarantinePolicyUsage = [System.Collections.Generic.List[object]]::new()
+        $ActionMappings = @(
+            @{ Action = 'SpamAction'; Tag = 'SpamQuarantineTag'; Label = 'Spam' }
+            @{ Action = 'HighConfidenceSpamAction'; Tag = 'HighConfidenceSpamQuarantineTag'; Label = 'High confidence spam' }
+            @{ Action = 'BulkSpamAction'; Tag = 'BulkQuarantineTag'; Label = 'Bulk spam' }
+        )
+
+        foreach ($Policy in $RelevantPolicies) {
+            foreach ($Mapping in $ActionMappings) {
+                if ($Policy.($Mapping.Action) -eq 'Quarantine') {
+                    $QuarantinePolicyUsage.Add([PSCustomObject]@{
+                            AntiSpamPolicy       = $Policy.Name
+                            Action               = $Mapping.Label
+                            QuarantinePolicyName = [string]$Policy.($Mapping.Tag)
+                        }) | Out-Null
+                }
             }
         }
 
-        if ($FailedPolicies.Count -eq 0 -and $PassedPolicies.Count -gt 0) {
+        $UsedQuarantinePolicies = [System.Collections.Generic.List[object]]::new()
+        foreach ($QuarantinePolicyName in @($QuarantinePolicyUsage.QuarantinePolicyName | Select-Object -Unique)) {
+            $QuarantinePolicy = $QuarantinePolicies | Where-Object { $_.Name -eq $QuarantinePolicyName } | Select-Object -First 1
+            $UsedBy = @($QuarantinePolicyUsage | Where-Object { $_.QuarantinePolicyName -eq $QuarantinePolicyName } | ForEach-Object { "$($_.AntiSpamPolicy) ($($_.Action))" })
+            $UsedQuarantinePolicies.Add([PSCustomObject]@{
+                    Name       = if ([string]::IsNullOrWhiteSpace($QuarantinePolicyName)) { 'Not configured' } else { $QuarantinePolicyName }
+                    ESNEnabled = if ($QuarantinePolicy) { [bool]($QuarantinePolicy.ESNEnabled -eq $true) } else { $false }
+                    Found      = [bool]$QuarantinePolicy
+                    UsedBy     = $UsedBy -join ', '
+                }) | Out-Null
+        }
+
+        $FailedPolicies = @($UsedQuarantinePolicies | Where-Object { -not $_.ESNEnabled })
+
+        if ($FailedPolicies.Count -eq 0) {
             $Status = 'Passed'
-            $Result = [System.Text.StringBuilder]::new("The Global Quarantine policy has end-user spam notifications enabled.`n`n")
-            $null = $Result.Append("| Policy Name | Notification Frequency |`n")
-            $null = $Result.Append("|------------|------------------------|`n")
-            foreach ($Policy in $PassedPolicies) {
-                $null = $Result.Append("| $($Policy.Identity) | $($Policy.DisplayFrequency) |`n")
+            $Result = [System.Text.StringBuilder]::new("All quarantine policies used by relevant EOP anti-spam actions have end-user spam notifications enabled.`n`n")
+            if ($UsedQuarantinePolicies.Count -eq 0) {
+                $null = $Result.Append('None of the relevant EOP anti-spam actions use quarantine.')
+            } else {
+                $null = $Result.Append("| Quarantine Policy | Used By |`n")
+                $null = $Result.Append("|-------------------|---------|`n")
+                foreach ($Policy in $UsedQuarantinePolicies) {
+                    $null = $Result.Append("| $($Policy.Name) | $($Policy.UsedBy) |`n")
+                }
             }
         } else {
             $Status = 'Failed'
-            $Result = [System.Text.StringBuilder]::new("The Global Quarantine policy does not have end-user spam notifications enabled.`n`n")
-            $null = $Result.Append("| Policy Name | Notification Frequency |`n")
-            $null = $Result.Append("|------------|------------------------|`n")
+            $Result = [System.Text.StringBuilder]::new("One or more quarantine policies used by relevant EOP anti-spam actions do not have end-user spam notifications enabled.`n`n")
+            $null = $Result.Append("| Quarantine Policy | Used By | Status |`n")
+            $null = $Result.Append("|-------------------|---------|--------|`n")
             foreach ($Policy in $FailedPolicies) {
-                $null = $Result.Append("| $($Policy.Identity) | $($Policy.DisplayFrequency) |`n")
+                $PolicyStatus = if ($Policy.Found) { 'End-user notifications are disabled' } else { 'Policy not found' }
+                $null = $Result.Append("| $($Policy.Name) | $($Policy.UsedBy) | $PolicyStatus |`n")
             }
-            $null = $Result.Append("`n**Remediation:** Configure the Global Quarantine policy with a notification frequency (e.g. PT4H, P1D, or P7D) via `Set-QuarantinePolicy -EndUserSpamNotificationFrequency`.")
+            $null = $Result.Append("`n**Remediation:** Enable end-user spam notifications on each quarantine policy listed above.")
         }
 
         Add-CippTestResult -TenantFilter $Tenant -TestId 'ORCA107' -TestType 'Identity' -Status $Status -ResultMarkdown $Result -Risk 'Low' -Name 'End-user spam notification is enabled' -UserImpact 'Low' -ImplementationEffort 'Low' -Category 'Quarantine'

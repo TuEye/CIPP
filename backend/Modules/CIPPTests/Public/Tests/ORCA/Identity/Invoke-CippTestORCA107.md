@@ -1,4 +1,6 @@
-Quarantine policies should enable end-user spam notifications to inform users about messages that have been quarantined. This allows users to review and release legitimate messages that may have been incorrectly identified as spam, reducing administrative overhead and improving user experience.
+Users should receive notifications about relevant spam messages that have been quarantined. This test checks that end-user notifications are enabled for the quarantine policies used by active anti-spam policies.
+
+Unused quarantine policies do not affect the result. Standard and Strict preset security policies are currently excluded from this check.
 
 **Remediation action**
 
